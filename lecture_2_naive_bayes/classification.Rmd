@@ -1,0 +1,263 @@
+# Table of Contents
+ <p><div class="lev1 toc-item"><a href="#Setup" data-toc-modified-id="Setup-1"><span class="toc-item-num">1&nbsp;&nbsp;</span>Setup</a></div><div class="lev1 toc-item"><a href="#Naive-Bayes" data-toc-modified-id="Naive-Bayes-2"><span class="toc-item-num">2&nbsp;&nbsp;</span>Naive Bayes</a></div><div class="lev1 toc-item"><a href="#Logistic-regression" data-toc-modified-id="Logistic-regression-3"><span class="toc-item-num">3&nbsp;&nbsp;</span>Logistic regression</a></div>
+
+# Setup
+
+First we load the usual libraries, along with the spam dataset from the Elements of Statistical Learning package, `e1071` for an implementation of naive Bayes, and ROCR for evaluation metrics.
+
+```{r}
+library(tidyverse)
+library(scales)
+library(ElemStatLearn)
+library(e1071)
+library(ROCR)
+
+theme_set(theme_bw())
+
+options(repr.plot.width=4, repr.plot.height=3)
+```
+
+Next we use the `spam` dataset and split the data in to a train and test set (ignoring validation for the time being).
+    
+The outcome (`email` or `spam`) is in last column (#58).
+
+```{r}
+set.seed(42)
+ndx <- sample(nrow(spam), floor(nrow(spam) * 0.9))
+train <- spam[ndx,]
+test <- spam[-ndx,]
+
+xTrain <- train[,-58]
+yTrain <- train$spam
+xTest <- test[,-58]
+yTest <- test$spam
+```
+
+# Naive Bayes
+
+Now we'll fit a naive Bayes model without any smoothing.
+
+The model has tables for the prior class probabilities (`apriori`) as well as for each feature (`tables`), and some extra info.
+
+```{r}
+model <- naiveBayes(xTrain, yTrain)
+summary(model)
+```
+
+Now we'll make predictions, which will be default return the most probable class label for each test example.
+
+```{r}
+df <- data.frame(actual = yTest,
+                 pred = predict(model, xTest))
+head(df)
+```
+
+The confusion matrix gives a summary of the classifiers performance, with the actual label determining the row, and the predicted label giving the column.
+
+```{r}
+table(df)
+```
+
+We can summarize this in a dizzying number of ways, each of which has multiple names.
+
+A few useful and popular metrics are listed below.
+
+```{r}
+# accuracy: fraction of correct classifications
+df %>%
+  summarize(acc = mean(pred == actual))
+
+# precision: fraction of positive predictions that are actually true
+df %>%
+  filter(pred == 'spam') %>%
+  summarize(prec = mean(actual == 'spam'))
+
+# recall: fraction of true examples that we predicted to be positive
+# aka true positive rate, sensitivity
+df %>%
+  filter(actual == 'spam') %>%
+  summarize(recall = mean(pred == 'spam'))
+
+# false positive rate: fraction of false examples that we predicted to be positive
+df %>%
+  filter(actual == 'email') %>%
+  summarize(fpr = mean(pred == 'spam'))
+```
+
+Next week can look at the raw probabilities predicted by naive Bayes by calling `predict` with `type = raw`, and examine a histogram of all predictions.
+
+Note that this is highly bimodal because naive Bayes is overconfident, a result of the independence assumption.
+
+```{r}
+# plot histogram of predicted probabilities
+# note overconfident predictions
+probs <- data.frame(predict(model, xTest, type="raw"))
+
+ggplot(probs, aes(x = spam)) +
+  geom_histogram(binwidth = 0.01) +
+  scale_x_continuous(label = percent) +
+  xlab('Predicted probability of spam') +
+  ylab('Number of examples')
+```
+
+We can also check calibration by looking at how often predicted probabilities match actual frequencies.
+
+This is most easily done by binning examples by their predicted probability of being spam and then counting how often those examples actually turn out to be spam.
+
+```{r}
+data.frame(predicted=probs[, "spam"], actual=yTest) %>%
+  group_by(predicted=round(predicted*10)/10) %>%
+  summarize(num=n(), actual=mean(actual == "spam")) %>%
+  ggplot(data=., aes(x=predicted, y=actual, size=num)) +
+  geom_point() +
+  geom_abline(linetype=2) +
+  scale_x_continuous(labels=percent, lim=c(0,1)) +
+  scale_y_continuous(labels=percent, lim=c(0,1)) +
+  xlab('Predicted probability of spam') +
+  ylab('Percent that are actually spam')
+```
+
+We can use the `ROCR` package to make a plot of the receiver operator characteristic (ROC) curve and compute the area under the curve (AUC).
+
+The ROC curve plots the true positive rate (also known as recall, sensitivity, or the probability of detecting a true example) against the false positive rate (also known as 1 - specificity, or the probability of a false alarm) as we change the threshold on the probability for predicting spam. In this case that's the fraction of all incoming spam detected vs. the fraction of legitimate emails that get labeled as spam.
+
+```{r}
+# create a ROCR object
+pred <- prediction(probs[, "spam"], yTest)
+
+# plot ROC curve
+perf_nb <- performance(pred, measure='tpr', x.measure='fpr')
+plot(perf_nb)
+performance(pred, 'auc')
+```
+
+Note that the area under the curve (AUC) is equivalent to the probability of scoring a randomly sampled positive example above a randomly sampled negative one.
+
+We can approximate this directly by repeated sampling of pairs of examples and checking for the correct ranking.
+
+```{r}
+# sample pos/neg pairs
+predicted <- probs[, "spam"]
+actual <- yTest == "spam"
+ndx_pos <- sample(which(actual == 1), size=100, replace=T)
+ndx_neg <- sample(which(actual == 0), size=100, replace=T)
+mean(predicted[ndx_pos] > predicted[ndx_neg])
+```
+
+# Logistic regression
+
+Next we'll fit a logistic regression model for the same data.
+
+Notice that the model is represented here by one weight for each feature. This is equivalent to the form of the predictor for naive Bayes, but all of the weights are learned together instead of being learned independently.
+
+```{r}
+model <- glm(spam ~ ., data=spam[ndx, ], family="binomial")
+model
+#summary(model)
+```
+
+Now we'll make predictions, which will be default return the log-odds of the example being spam.
+
+```{r}
+df <- data.frame(actual = yTest,
+                 log_odds = predict(model, xTest)) %>%
+  mutate(pred = ifelse(log_odds > 0, 'spam', 'email'))
+head(df)
+```
+
+Now we'll look at the confusion matrix again, seeing better performance as indicated by the smaller off-diagonal entires.
+
+```{r}
+table(actual = df$actual, predicted = df$pred)
+```
+
+Summarizing this in various ways also reflects the improvement.
+
+```{r}
+# accuracy: fraction of correct classifications
+df %>%
+    summarize(acc = mean(pred == actual))
+
+# precision: fraction of positive predictions that are actually true
+df %>%
+  filter(pred == 'spam') %>%
+  summarize(prec = mean(actual == 'spam'))
+
+# recall: fraction of true examples that we predicted to be positive
+# aka true positive rate, sensitivity
+df %>%
+  filter(actual == 'spam') %>%
+  summarize(recall = mean(pred == 'spam'))
+
+# false positive rate: fraction of false examples that we predicted to be positive
+df %>%
+  filter(actual == 'email') %>%
+  summarize(fpr = mean(pred == 'spam'))
+```
+
+Plotting the distribution of predicted probabilities shows that the overconfidence problem has been addressed.
+
+Notice that you call `predict` with `type = response` to get probabilities instead of log-odds.
+
+```{r}
+# plot histogram of predicted probabilities
+plot_data <- spam[-ndx, ]
+plot_data$probs <- predict(model, spam[-ndx, ], type="response")
+ggplot(plot_data, aes(x = probs)) +
+  geom_histogram(binwidth = 0.01) +
+  xlab('Predicted probability of spam') +
+  ylab('Number of examples')
+```
+
+And the calibration plot looks more sensible as well.
+
+```{r}
+# plot calibration
+data.frame(predicted=plot_data$probs, actual=yTest) %>%
+  group_by(predicted=round(predicted*10)/10) %>%
+  summarize(num=n(), actual=mean(actual == "spam")) %>%
+  ggplot(data=., aes(x=predicted, y=actual, size=num)) +
+  geom_point() +
+  geom_abline(linetype=2) +
+  scale_x_continuous(labels=percent, lim=c(0,1)) +
+  scale_y_continuous(labels=percent, lim=c(0,1)) +
+  xlab('Predicted probability of spam') +
+  ylab('Percent that are actually spam')
+```
+
+Just as with naive Bayes, we can plot the ROC curve.
+
+```{r}
+pred <- prediction(plot_data$probs, yTest)
+perf_lr <- performance(pred, measure='tpr', x.measure='fpr')
+plot(perf_lr)
+performance(pred, 'auc')
+```
+
+And a sampling approach to approximate the AUC shows the same.
+
+```{r}
+predicted <- plot_data$probs
+actual <- yTest == "spam"
+ndx_pos <- sample(which(actual == 1), size=100, replace=T)
+ndx_neg <- sample(which(actual == 0), size=100, replace=T)
+mean(predicted[ndx_pos] > predicted[ndx_neg])
+```
+
+Finally, we can combine both ROC curves on one clean plot.
+
+```{r}
+roc_nb <- data.frame(fpr=unlist(perf_nb@x.values), tpr=unlist(perf_nb@y.values))
+roc_nb$method <- "naive bayes"
+roc_lr <- data.frame(fpr=unlist(perf_lr@x.values), tpr=unlist(perf_lr@y.values))
+roc_lr$method <- "logistic regression"
+rbind(roc_nb, roc_lr) %>%
+  ggplot(data=., aes(x=fpr, y=tpr, linetype=method, color=method)) + 
+  geom_line() +
+  geom_abline(linetype=2) +
+  scale_x_continuous(labels=percent, lim=c(0,1)) +
+  scale_y_continuous(labels=percent, lim=c(0,1)) +
+  xlab('Probability of a false alarm') +
+  ylab('Probability of detecting spam') +
+  theme(legend.position=c(0.7,0.2), legend.title=element_blank())
+```
