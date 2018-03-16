@@ -1,0 +1,303 @@
+This notebook looks at using R for fitting linear models.
+
+# Table of Contents
+ <p><div class="lev1 toc-item"><a href="#Setup" data-toc-modified-id="Setup-1"><span class="toc-item-num">1&nbsp;&nbsp;</span>Setup</a></div><div class="lev1 toc-item"><a href="#Descriptives-by-age-and-gender" data-toc-modified-id="Descriptives-by-age-and-gender-2"><span class="toc-item-num">2&nbsp;&nbsp;</span>Descriptives by age and gender</a></div><div class="lev1 toc-item"><a href="#Modeling-pageviews" data-toc-modified-id="Modeling-pageviews-3"><span class="toc-item-num">3&nbsp;&nbsp;</span>Modeling pageviews</a></div><div class="lev2 toc-item"><a href="#Views-by-age,-linear-features" data-toc-modified-id="Views-by-age,-linear-features-31"><span class="toc-item-num">3.1&nbsp;&nbsp;</span>Views by age, linear features</a></div><div class="lev2 toc-item"><a href="#Views-by-age,-quadratic-features" data-toc-modified-id="Views-by-age,-quadratic-features-32"><span class="toc-item-num">3.2&nbsp;&nbsp;</span>Views by age, quadratic features</a></div><div class="lev2 toc-item"><a href="#Views-by-age-and-gender,-no-interactions" data-toc-modified-id="Views-by-age-and-gender,-no-interactions-33"><span class="toc-item-num">3.3&nbsp;&nbsp;</span>Views by age and gender, no interactions</a></div><div class="lev2 toc-item"><a href="#Views-by-age-and-gender,-with-interactions" data-toc-modified-id="Views-by-age-and-gender,-with-interactions-34"><span class="toc-item-num">3.4&nbsp;&nbsp;</span>Views by age and gender, with interactions</a></div>
+
+# Setup
+
+First we'll load some packages, including the recent `modelr` for easy modeling, setting options to warn us whenever observations with missing values are ignored by our models.
+
+```{r}
+library(tidyverse)
+library(scales)
+
+library(modelr)
+options(na.action = na.warn)
+
+theme_set(theme_bw())
+options(repr.plot.width=4, repr.plot.height=3)
+```
+
+Now we'll read in a file containing containing information on 225,000 anonymous Nielsen panelists, containing their age, gender, and the number of pages (~distinct urls) they typically access on their web browser each day.
+
+```{r}
+users <- read_tsv(gzfile('users.tsv.gz'))
+head(users)
+```
+
+Let's take a quick look at the distribution of daily pageviews, which we'll plot on log scale.
+
+```{r}
+# histogram of the label/regressor variable:
+ggplot(users, aes(x = daily.views)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10(label=comma, breaks=10^(0:ceiling(log10(max(users$daily.views))))) +
+  scale_y_continuous(label = comma) +
+  xlab('Daily pageviews') +
+  ylab('')
+ggsave(filename='figures/daily_pageviews_dist.pdf', width=4, height=4)
+```
+
+Most people view around 100 pages per day, with a few accounts showing several thousand while others have almost done. These extremes are probably instrumentation or logging errors.
+
+Notice the warning about the infinite values. These are people with zero daily views, who we'll filter out later.
+
+# Descriptives by age and gender
+
+Next a few simple plots to see how activity varies by age and gender.
+
+One idea is to plot every user as one point, located by their age and daily pageviews, splitting by gender.
+
+```{r}
+ggplot(data = users, aes(x = age, y = daily.views)) +
+  geom_point() +
+  facet_wrap(~ gender) +
+  xlab('Age') +
+  ylab('Daily pageviews')
+ggsave(filename='figures/daily_pageviews_by_age_and_gender.pdf', width=8, height=4)
+```
+
+This shows us a bit about the data, but there are two problems: first, there are too many points on the plot, and second the extremes dominate the scale.
+
+Let's filter out the ~100 users with no views and then count median views by age and gender to summarize the data. The median will mitigate the skew from the extremes and give us an idea of the "typical" user at any age and gender.
+
+```{r}
+nrow(users)
+users <- filter(users, daily.views > 0)
+nrow(users)
+```
+
+```{r}
+views_by_age_and_gender <- users %>%
+  filter(age <= 90) %>%
+  group_by(age, gender) %>%
+  summarize(count = n(),
+            median_daily_views = median(daily.views))
+head(views_by_age_and_gender)
+```
+
+Let's plot these results to get an idea of any trends in the data.
+
+We'll use point size to indicate the number of users at each age and gender.
+
+```{r}
+options(repr.plot.width=6, repr.plot.height=3)
+ggplot(views_by_age_and_gender, aes(x = age, y = median_daily_views, color = gender)) +
+  geom_line(aes(linetype=gender)) +
+  geom_point(aes(size = count)) +
+  xlab('Age') + 
+  ylab('Daily pageviews') +
+  scale_size_area(guide = F) +
+  theme(legend.title=element_blank())
+ggsave(filename='figures/median_daily_pageviews_by_age_and_gender.pdf', width=8, height=4)
+```
+
+Now we see a few clear trends.
+
+First, data is fairly sparse under 18 years of 18, and then seems to suddenly jump up. Likewise, there isn't much data for people over 65. Finally, it looks like men generate fewer views than women, and viewing habits change differently with age for men and women.
+
+# Modeling pageviews
+
+Let's models to smooth out some of the noise in the descriptives and pull out clearer trends. We'll focus on people between 18 and 65, where most of the data are.
+
+```{r}
+model_data <- filter(users, age >= 18 & age <= 65)
+```
+
+## Views by age, linear features
+
+We'll start by just using `geom_smooth` with a linear model to show an overall age trend.
+
+```{r}
+options(repr.plot.width=4, repr.plot.height=3)
+ggplot(model_data, aes(x = age, y = daily.views)) +
+  geom_smooth(method = "lm") +
+  scale_y_log10(breaks = 1:100)
+```
+
+This shows the simple trend that pageviews go down with age, on average.
+
+Now, instead of having `ggplot2` do the modeling for us, let's do it ourselves using `lm`.
+
+Informed by our earlier plots, we'll work in log space, and specify a simple formula for the model.
+
+```{r}
+model <- lm(log10(daily.views) ~ age, model_data)
+model
+# see summary(model) for more information, including standard errors and p-values for these estimates
+```
+
+Behind the scenes, R has used our formula to convert the `model_data` data frame to a matrix of features and solves the normal equations. Here's a look at what was created.
+
+```{r}
+M <- model.matrix(log10(daily.views) ~ age, model_data)
+head(M)
+```
+
+Notice that a constant feature has been added to incorporate an intercept in the model. This will get more interesting as we change the structure of the model below.
+
+Next we'll plot the model's predictions, transforming things back from log space. This is often much easier than staring at a table of cofficient estimates.
+
+First, we need to get predictions out of the model. The old way to do this was to create a new data frame with the values to make predictions from and then call the `predict` or `fitted` functions from base R, but this is a bit ugly.
+
+```{r}
+plot_data <- model_data %>%
+  distinct(age)
+plot_data$predicted <- 10^predict(model, plot_data)
+head(plot_data)
+```
+
+The `modelr` package provides cleaner syntax for doing this, along with some helper functions.
+
+`data_grid` takes all combinations of all of the unique values in each column provided to it (here just a list of every age), and `add_predictions` adds the predicted values.
+
+The result is equivalent to the above, with the rows in different order.
+
+```{r}
+plot_data <- model_data %>%
+  data_grid(age) %>%
+  add_predictions(model) %>%
+  mutate(pred = 10^pred)
+head(plot_data)
+```
+
+Finally, we can make our own version of the `geom_smooth` plot above.
+
+```{r}
+ggplot(plot_data, aes(x = age, y = pred)) +
+  geom_line()
+```
+
+This is somewhat useful, but it's always nice to have the actual data to compare against the model.
+
+We can add this using yet a third way of generating plot data, this time by summarizing the model data and computing the (geometric) mean of the daily views for each age and then adding predictions.
+
+The geometric mean is just the average in log space, which is exactly what the model is trying to capture.
+
+```{r}
+plot_data <- model_data %>%
+  group_by(age) %>%
+  summarize(count = n(),
+            geom_mean_daily_views = 10^(mean(log10(daily.views)))) %>%
+  add_predictions(model) %>%
+  mutate(pred = 10^pred)
+head(plot_data)
+```
+
+```{r}
+ggplot(plot_data, aes(x = age, y = pred)) +
+  geom_line(aes(y = pred)) +
+  geom_point(aes(y = geom_mean_daily_views, size = count)) +
+  scale_size_area(guide = F)
+```
+
+From this it's clear that our simple linear model is missing some important trends: viewing rises in the 20s and 30s, and then declines.
+
+## Views by age, quadratic features
+
+Luckily we can capture this non-linear pattern with a linear model. This might sound surprising, but the "linear" in the model refers to the fact that the model is linear in the weights, not the features.
+
+So we can continue to use `lm`, but just add a non-linear feature, the square of a person's age. This will let us fit a parabola instead of a line. In R syntax we just "add" this feature to the model with the appropriate formula syntax.
+
+```{r}
+model <- lm(log10(daily.views) ~ age + I(age^2), model_data)
+model
+```
+
+Again, we can look at the model matrix that was created behind the scenes, which is now more interesting and contains another column.
+
+```{r}
+M <- model.matrix(log10(daily.views) ~ age + I(age^2), model_data)
+head(M)
+```
+
+And we can plot the new model against the data, to see that there's a much better fit.
+
+```{r}
+plot_data <- model_data %>%
+  group_by(age) %>%
+  summarize(count = n(),
+            geom_mean_daily_views = 10^(mean(log10(daily.views)))) %>%
+  add_predictions(model) %>%
+  mutate(pred = 10^pred)
+
+ggplot(plot_data, aes(x = age, y = pred)) +
+  geom_line(aes(y = pred)) +
+  geom_point(aes(y = geom_mean_daily_views, size = count)) +
+  scale_size_area(guide = F)
+```
+
+## Views by age and gender, no interactions
+
+Now, following our descriptive plot above, let's add gender to the model.
+
+The simplest way we could do this is to add a fixed offset for gender.
+
+```{r}
+form <- as.formula(log10(daily.views) ~ gender + age + I(age^2))
+M <- model.matrix(form, model_data)
+model <- lm(form, model_data)
+head(M)
+model
+```
+
+Notice what's happened here. R recognized that `gender` was a factor and added a column for it.
+
+Specifically, it took the first level of the factor (`female`), and made it the default, and then added a column called `genderMale` which is 0 for men and 1 for women. The result is that the intercept implicitly incorporates information about female viewing habits.
+
+Again, it's difficult to get the full picture from the coefficients table, so let's plot the results.
+
+```{r}
+options(repr.plot.width=6, repr.plot.height=3)
+plot_data <- model_data %>%
+  group_by(age, gender) %>%
+  summarize(count = n(),
+            geom_mean_daily_views = 10^(mean(log10(daily.views)))) %>%
+  add_predictions(model) %>%
+  mutate(pred = 10^pred)
+
+ggplot(plot_data, aes(x = age, y = pred, color = gender)) +
+  geom_line(aes(y = pred)) +
+  geom_point(aes(y = geom_mean_daily_views, size = count)) +
+  scale_size_area(guide = F)
+```
+
+The plot makes clear a failing of the model: simply "adding" gender to the model doesn't capture the fact that women's activity goes up and then down with age, while men's goes down and then up.
+
+## Views by age and gender, with interactions
+
+What we've failed to capture is that we want a different parabola by gender, meaning we'd like different coefficients for the `age` and `age^2` terms for men and women. This is referred to as an "interaction".
+
+Here's one way to specify this in an R formula. (See [here](http://bit.ly/2m0gWH8) for more on formula syntax.)
+
+```{r}
+form <- as.formula(log10(daily.views) ~ gender * (age + I(age^2)))
+M <- model.matrix(form, model_data)
+model <- lm(form, model_data)
+head(M)
+model
+```
+
+Again, looking at the model matrix and the table of coefficients shows that R has done a lot of work to create new features.
+
+In addition to the columns we had before, now we have columns for `genderMale:age` and `genderMale:I(age^2)`. These last two columns are zero for females, and age or its square for males. This results in a different parabola by gender.
+
+It gets increasingly difficult to interpret the fitted coefficients as we add more and more interactions to our models, so let's plot the results one last time.
+
+```{r}
+plot_data <- model_data %>%
+  group_by(age, gender) %>%
+  summarize(count = n(),
+            geom_mean_daily_views = 10^(mean(log10(daily.views)))) %>%
+  add_predictions(model) %>%
+  mutate(pred = 10^pred)
+
+options(repr.plot.width=6, repr.plot.height=3)
+ggplot(plot_data, aes(x = age, y = pred, color = gender)) +
+  geom_line(aes(y = pred)) +
+  geom_point(aes(y = geom_mean_daily_views, size = count)) +
+  scale_size_area(guide = F)
+ggsave(filename='figures/modeled_daily_pageviews_by_age_and_gender.pdf', width=8, height=4)
+```
+
+Finally we have a model that captures most of the regularities in our data, while glossing over the noise.
